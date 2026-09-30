@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -278,6 +279,100 @@ func TestOldResourcesWaitForInflightLeaseThenCloseInReverseOrder(t *testing.T) {
 	}
 }
 
+func TestOnlyPublishedConfigurationIsPersistedAndRecovered(t *testing.T) {
+	ctx := context.Background()
+	closes := &closeLog{}
+	db := &testModule{name: "db", closes: closes}
+	service := &testModule{name: "service", deps: []string{"db"}, closes: closes}
+	api := &testModule{name: "api", deps: []string{"service"}, closes: closes}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+
+	manager, err := NewManager(configPath, api, service, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(ctx, configFor(1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if generation := persistedGeneration(t, configPath); generation != 1 {
+		t.Fatalf("persisted generation after initial publish = %d, want 1", generation)
+	}
+
+	restarted, err := Open(ctx, configPath, api, service, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Start(ctx, configFor(2, nil)); err == nil {
+		t.Fatal("duplicate start unexpectedly succeeded")
+	}
+	if generation := persistedGeneration(t, configPath); generation != 1 {
+		t.Fatalf("persisted generation after duplicate start = %d, want 1", generation)
+	}
+	closesBeforeFailedReload := len(closes.snapshot())
+	if err := restarted.Reload(ctx, configFor(3, map[string]bool{"service": true})); err == nil {
+		t.Fatal("failed preparation unexpectedly succeeded")
+	}
+	if generation := persistedGeneration(t, configPath); generation != 1 {
+		t.Fatalf("persisted generation after failed preparation = %d, want 1", generation)
+	}
+	var preparedGenerationThreeClosed bool
+	for _, event := range closes.snapshot()[closesBeforeFailedReload:] {
+		if event.generation == 3 {
+			preparedGenerationThreeClosed = true
+		}
+		if event.generation == 1 {
+			t.Fatalf("active generation 1 resource closed during failed candidate: %+v", event)
+		}
+	}
+	if !preparedGenerationThreeClosed {
+		t.Fatal("prepared generation 3 resource was not abandoned")
+	}
+	if err := restarted.Reload(ctx, configFor(4, map[string]bool{"validate": true})); err == nil {
+		t.Fatal("failed validation unexpectedly succeeded")
+	}
+	if generation := persistedGeneration(t, configPath); generation != 1 {
+		t.Fatalf("persisted generation after failed validation = %d, want 1", generation)
+	}
+
+	if err := restarted.Reload(ctx, configFor(2, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if generation := persistedGeneration(t, configPath); generation != 2 {
+		t.Fatalf("persisted generation after publish and close = %d, want 2", generation)
+	}
+	var activeGenerationTwoClosed int
+	for _, event := range closes.snapshot() {
+		if event.generation == 2 {
+			activeGenerationTwoClosed++
+		}
+	}
+	if activeGenerationTwoClosed != 3 {
+		t.Fatalf("closed generation 2 resources = %d, want 3", activeGenerationTwoClosed)
+	}
+
+	reopened, err := Open(ctx, configPath, api, service, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := reopened.Lease()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generation := leaseGeneration(t, lease); generation != 2 {
+		t.Fatalf("recovered generation = %d, want 2", generation)
+	}
+	lease.Release()
+	if err := reopened.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStartupAndShutdownFollowDependencyOrder(t *testing.T) {
 	order, err := (&Manager{modules: map[string]Module{
 		"db":      &testModule{name: "db"},
@@ -293,6 +388,23 @@ func TestStartupAndShutdownFollowDependencyOrder(t *testing.T) {
 			t.Fatalf("startup order = %v, want %v", order, want)
 		}
 	}
+}
+
+func persistedGeneration(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	var moduleCfg testConfig
+	if err := json.Unmarshal(cfg["api"], &moduleCfg); err != nil {
+		t.Fatal(err)
+	}
+	return moduleCfg.Generation
 }
 
 func configFor(generation int, failures map[string]bool) Config {

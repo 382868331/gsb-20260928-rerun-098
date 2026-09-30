@@ -70,6 +70,11 @@ type version struct {
 	leases    sync.WaitGroup
 }
 
+type configCandidate struct {
+	version   *version
+	abandoned bool
+}
+
 type Manager struct {
 	configPath string
 	modules    map[string]Module
@@ -122,65 +127,72 @@ func Open(ctx context.Context, configPath string, modules ...Module) (*Manager, 
 		return nil, err
 	}
 	if cfg != nil {
-		next, err := m.buildVersion(ctx, cfg)
+		candidate, err := m.prepareCandidate(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}
-		m.active.Store(next)
+		m.active.Store(candidate.version)
 	}
 	return m, nil
 }
 
 func (m *Manager) Start(ctx context.Context, cfg Config) error {
-	m.switchMu.Lock()
-	defer m.switchMu.Unlock()
-
-	next, err := m.buildVersion(ctx, cloneConfig(cfg))
-	if err != nil {
-		return err
-	}
-	if err := persistConfig(m.configPath, next.config); err != nil {
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return err
-	}
-	m.stateMu.Lock()
-	if m.closed {
-		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return errors.New("runtime manager is closed")
-	}
-	if m.active.Load() != nil {
-		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return errors.New("runtime already started")
-	}
-	m.active.Store(next)
-	m.stateMu.Unlock()
-	return nil
+	return m.publish(ctx, cfg, true)
 }
 
 func (m *Manager) Reload(ctx context.Context, cfg Config) error {
+	return m.publish(ctx, cfg, false)
+}
+
+func (m *Manager) publish(ctx context.Context, cfg Config, requireInactive bool) error {
 	m.switchMu.Lock()
 	defer m.switchMu.Unlock()
 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	next, err := m.buildVersion(ctx, cloneConfig(cfg))
+	if m.configPath == "" {
+		return errors.New("configuration path is empty")
+	}
+	if err := m.checkPublishable(requireInactive); err != nil {
+		return err
+	}
+
+	candidate, err := m.prepareCandidate(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	if err := persistConfig(m.configPath, next.config); err != nil {
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return err
+
+	m.stateMu.Lock()
+	previous := m.active.Load()
+	if m.closed || (requireInactive && previous != nil) {
+		m.stateMu.Unlock()
+		abandonErr := candidate.abandon(context.WithoutCancel(ctx))
+		if m.closed {
+			return errors.Join(errors.New("runtime manager is closed"), abandonErr)
+		}
+		return errors.Join(errors.New("runtime already started"), abandonErr)
 	}
+	m.stateMu.Unlock()
+
+	if err := persistConfig(m.configPath, candidate.version.config); err != nil {
+		return errors.Join(err, candidate.abandon(context.WithoutCancel(ctx)))
+	}
+
 	m.stateMu.Lock()
 	if m.closed {
 		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return errors.New("runtime manager is closed")
+		return errors.Join(errors.New("runtime manager is closed"), candidate.rollback(context.WithoutCancel(ctx), previous))
 	}
-	previous := m.active.Swap(next)
+	if previous != m.active.Load() {
+		m.stateMu.Unlock()
+		rollbackErr := candidate.rollback(context.WithoutCancel(ctx), previous)
+		if requireInactive && previous == nil {
+			return errors.Join(errors.New("runtime already started"), rollbackErr)
+		}
+		return errors.Join(errors.New("runtime state changed during publish"), rollbackErr)
+	}
+	m.active.Store(candidate.version)
 	if previous != nil {
 		m.retireVersion(previous)
 	}
@@ -213,10 +225,14 @@ func (m *Manager) ActiveConfig() (Config, bool) {
 }
 
 func (m *Manager) Close(ctx context.Context) error {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+
 	m.stateMu.Lock()
 	if m.closed {
+		done := m.closeDone
 		m.stateMu.Unlock()
-		<-m.closeDone
+		<-done
 		return nil
 	}
 	m.closed = true
@@ -292,34 +308,63 @@ func (m *Manager) startupOrder() ([]string, error) {
 	return ordered, nil
 }
 
-func (m *Manager) buildVersion(ctx context.Context, cfg Config) (*version, error) {
+func (m *Manager) checkPublishable(requireInactive bool) error {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	if m.closed {
+		return errors.New("runtime manager is closed")
+	}
+	if requireInactive && m.active.Load() != nil {
+		return errors.New("runtime already started")
+	}
+	return nil
+}
+
+func (m *Manager) prepareCandidate(ctx context.Context, cfg Config) (*configCandidate, error) {
 	order, err := m.startupOrder()
 	if err != nil {
 		return nil, err
 	}
+	candidate := &configCandidate{version: &version{
+		config:    cloneConfig(cfg),
+		resources: make(map[string]Resource, len(order)),
+		order:     order,
+	}}
 	for _, name := range order {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, errors.Join(err, candidate.abandon(context.WithoutCancel(ctx)))
 		}
 		if err := m.modules[name].Validate(ctx, ModuleConfig{Name: name, Raw: cfg[name]}); err != nil {
-			return nil, fmt.Errorf("validate module %q: %w", name, err)
+			return nil, errors.Join(fmt.Errorf("validate module %q: %w", name, err), candidate.abandon(context.WithoutCancel(ctx)))
 		}
 	}
-	v := &version{config: cloneConfig(cfg), resources: make(map[string]Resource, len(order)), order: order}
 	for _, name := range order {
 		if err := ctx.Err(); err != nil {
-			return nil, errors.Join(err, closeResources(context.WithoutCancel(ctx), v))
+			return nil, errors.Join(err, candidate.abandon(context.WithoutCancel(ctx)))
 		}
 		resource, err := m.modules[name].Prepare(ctx, ModuleConfig{Name: name, Raw: cfg[name]})
 		if err != nil {
-			return nil, errors.Join(fmt.Errorf("prepare module %q: %w", name, err), closeResources(context.WithoutCancel(ctx), v))
+			return nil, errors.Join(fmt.Errorf("prepare module %q: %w", name, err), candidate.abandon(context.WithoutCancel(ctx)))
 		}
 		if resource == nil {
 			resource = noopResource{}
 		}
-		v.resources[name] = resource
+		candidate.version.resources[name] = resource
 	}
-	return v, nil
+	return candidate, nil
+}
+
+func (c *configCandidate) abandon(ctx context.Context) error {
+	if c == nil || c.abandoned {
+		return nil
+	}
+	c.abandoned = true
+	return closeResources(ctx, c.version)
+}
+
+func (c *configCandidate) rollback(ctx context.Context, previous *version) error {
+	_ = previous
+	return c.abandon(ctx)
 }
 
 func (m *Manager) retireVersion(v *version) {
