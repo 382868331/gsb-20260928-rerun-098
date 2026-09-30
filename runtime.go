@@ -84,6 +84,22 @@ type Manager struct {
 	closeDone chan struct{}
 }
 
+var (
+	ErrClosed         = errors.New("runtime manager is closed")
+	ErrAlreadyStarted = errors.New("runtime already started")
+	ErrNotStarted     = errors.New("runtime is not started")
+)
+
+// Candidate is a fully prepared configuration version that has not yet been
+// published. Its resources exist, but it is neither active nor persisted.
+// A candidate must end with either Commit (publish) or Abort (discard); a
+// failed Commit discards the candidate automatically.
+type Candidate struct {
+	manager   *Manager
+	version   *version
+	abandoned atomic.Bool
+}
+
 type retiredVersion struct {
 	version *version
 	done    chan error
@@ -135,56 +151,136 @@ func (m *Manager) Start(ctx context.Context, cfg Config) error {
 	m.switchMu.Lock()
 	defer m.switchMu.Unlock()
 
-	next, err := m.buildVersion(ctx, cloneConfig(cfg))
+	candidate, err := m.Prepare(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	if err := persistConfig(m.configPath, next.config); err != nil {
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return err
-	}
-	m.stateMu.Lock()
-	if m.closed {
-		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return errors.New("runtime manager is closed")
-	}
-	if m.active.Load() != nil {
-		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return errors.New("runtime already started")
-	}
-	m.active.Store(next)
-	m.stateMu.Unlock()
-	return nil
+	return candidate.Commit(ctx, false)
 }
 
 func (m *Manager) Reload(ctx context.Context, cfg Config) error {
 	m.switchMu.Lock()
 	defer m.switchMu.Unlock()
 
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	next, err := m.buildVersion(ctx, cloneConfig(cfg))
+	candidate, err := m.Prepare(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	if err := persistConfig(m.configPath, next.config); err != nil {
-		_ = closeResources(context.WithoutCancel(ctx), next)
+	return candidate.Commit(ctx, true)
+}
+
+// Prepare validates cfg and creates every resource it needs, producing a
+// candidate that can later be committed, rolled back to, or abandoned.
+// Preparation never touches the active version and never writes disk, so a
+// failed preparation leaves both current state and the persisted record
+// untouched. All resources created so far are released on failure.
+func (m *Manager) Prepare(ctx context.Context, cfg Config) (*Candidate, error) {
+	next, err := m.buildVersion(ctx, cloneConfig(cfg))
+	if err != nil {
+		return nil, err
+	}
+	return &Candidate{manager: m, version: next}, nil
+}
+
+// Commit publishes the candidate atomically with its persistence record.
+//
+// The persisted file is written first while holding the manager state lock;
+// only a durable, successful write can activate the new version. Therefore:
+//   - a duplicate Start, a closed manager, or a persistence failure never
+//     overwrites the on-disk configuration of the currently running version;
+//   - a process restart can only ever restore a configuration that was truly
+//     published.
+//
+// On any failure the candidate's freshly prepared resources are abandoned.
+// When requireActive is false the candidate performs an initial start; when
+// it is true the candidate replaces an existing active version (reload).
+func (c *Candidate) Commit(ctx context.Context, requireActive bool) error {
+	if c == nil {
+		return errors.New("commit of nil candidate")
+	}
+	if c.manager == nil || c.abandoned.Load() {
+		return errors.New("candidate has already been committed or abandoned")
+	}
+	m := c.manager
+	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
+	activeExists := m.active.Load() != nil
+	if m.closed {
+		c.abortLocked(context.WithoutCancel(ctx))
+		return ErrClosed
+	}
+	if !requireActive && activeExists {
+		c.abortLocked(context.WithoutCancel(ctx))
+		return ErrAlreadyStarted
+	}
+	if requireActive && !activeExists {
+		c.abortLocked(context.WithoutCancel(ctx))
+		return ErrNotStarted
+	}
+	// Persist while locked: a failed write (including duplicate-start style
+	// races) can never leave a newer configuration on disk than in memory.
+	if err := persistConfig(m.configPath, c.version.config); err != nil {
+		c.abortLocked(context.WithoutCancel(ctx))
+		return err
+	}
+	previous := m.active.Swap(c.version)
+	c.version = nil
+	c.abandoned.Store(true)
+	if previous != nil {
+		m.retireVersionLocked(previous)
+	}
+	return nil
+}
+
+// Abort discards a candidate that will never be published. Prepared
+// resources are closed in reverse dependency order. It is safe to call once
+// and after a successful Commit (the latter is a no-op).
+func (c *Candidate) Abort(ctx context.Context) error {
+	if c == nil || c.manager == nil {
+		return nil
+	}
+	c.manager.stateMu.Lock()
+	defer c.manager.stateMu.Unlock()
+	return c.abortLocked(ctx)
+}
+
+func (c *Candidate) abortLocked(ctx context.Context) error {
+	if c.abandoned.Swap(true) {
+		return nil
+	}
+	if c.version == nil {
+		return nil
+	}
+	v := c.version
+	c.version = nil
+	return closeResources(ctx, v)
+}
+
+// Rollback publishes the candidate as a recovery point: it replaces the
+// currently active version like Reload, but it does not overwrite the
+// persisted configuration. This is used to revert in-memory state to a
+// configuration known to be durably stored when a newer candidate cannot be
+// published. The previously active version is retired and its resources are
+// kept alive until every in-flight lease is released.
+func (m *Manager) Rollback(ctx context.Context, cfg Config) error {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+
+	candidate, err := m.Prepare(ctx, cfg)
+	if err != nil {
 		return err
 	}
 	m.stateMu.Lock()
+	defer m.stateMu.Unlock()
 	if m.closed {
-		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), next)
-		return errors.New("runtime manager is closed")
+		_ = candidate.abortLocked(context.WithoutCancel(ctx))
+		return ErrClosed
 	}
-	previous := m.active.Swap(next)
+	previous := m.active.Swap(candidate.version)
+	candidate.version = nil
 	if previous != nil {
-		m.retireVersion(previous)
+		m.retireVersionLocked(previous)
 	}
-	m.stateMu.Unlock()
 	return nil
 }
 
@@ -192,12 +288,12 @@ func (m *Manager) Lease() (*Lease, error) {
 	m.stateMu.RLock()
 	if m.closed {
 		m.stateMu.RUnlock()
-		return nil, errors.New("runtime manager is closed")
+		return nil, ErrClosed
 	}
 	v := m.active.Load()
 	if v == nil {
 		m.stateMu.RUnlock()
-		return nil, errors.New("runtime is not started")
+		return nil, ErrNotStarted
 	}
 	v.leases.Add(1)
 	m.stateMu.RUnlock()
@@ -322,7 +418,10 @@ func (m *Manager) buildVersion(ctx context.Context, cfg Config) (*version, error
 	return v, nil
 }
 
-func (m *Manager) retireVersion(v *version) {
+// retireVersionLocked registers v for asynchronous retirement. Resources stay
+// open until every outstanding lease is released, then close in reverse
+// dependency order. Caller must hold m.stateMu.
+func (m *Manager) retireVersionLocked(v *version) {
 	item := &retiredVersion{version: v, done: make(chan error, 1)}
 	m.retired = append(m.retired, item)
 	go func() {
