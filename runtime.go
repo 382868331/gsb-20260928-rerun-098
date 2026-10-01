@@ -10,6 +10,17 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
+)
+
+var (
+	// ErrBaselineChanged indicates that a candidate was prepared from a base
+	// revision which is no longer active. The candidate must be abandoned and
+	// re-prepared against the current revision; it can never overwrite a newer
+	// publish.
+	ErrBaselineChanged = errors.New("candidate baseline is no longer active")
+	ErrCandidateClosed = errors.New("candidate is no longer open")
+	ErrRevisionMissing = errors.New("revision is not part of the release history")
 )
 
 type ModuleConfig struct {
@@ -64,15 +75,219 @@ func (l *Lease) Release() {
 }
 
 type version struct {
+	revision  int64
 	config    Config
 	resources map[string]Resource
 	order     []string
 	leases    sync.WaitGroup
 }
 
-type configCandidate struct {
-	version   *version
-	abandoned bool
+const (
+	candidatePrepared  = "prepared"
+	candidatePublished = "published"
+	candidateAbandoned = "abandoned"
+)
+
+// Candidate is a fully prepared configuration that has not yet been published.
+// Its resources stay alive until Publish, Abandon or Manager.Close, but a
+// prepared candidate never becomes active on its own.
+type Candidate struct {
+	manager  *Manager
+	id       string
+	baseline int64
+	version  *version
+	created  time.Time
+
+	mu    sync.Mutex
+	state string
+}
+
+func (c *Candidate) ID() string {
+	return c.id
+}
+
+// Baseline is the revision that was active when the candidate was prepared.
+func (c *Candidate) Baseline() int64 {
+	return c.baseline
+}
+
+func (c *Candidate) Config() Config {
+	return cloneConfig(c.version.config)
+}
+
+func (c *Candidate) CreatedAt() time.Time {
+	return c.created
+}
+
+func (c *Candidate) Status() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.state
+}
+
+// Publish switches the active version to the candidate. It fails with
+// ErrBaselineChanged when another publish has moved the active revision since
+// the candidate was prepared; the candidate and its resources stay intact in
+// that case so the caller can inspect them before calling Abandon.
+func (c *Candidate) Publish(ctx context.Context) error {
+	m := c.manager
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+
+	c.mu.Lock()
+	if c.state != candidatePrepared {
+		state := c.state
+		c.mu.Unlock()
+		return fmt.Errorf("%w: %s", ErrCandidateClosed, state)
+	}
+	c.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		m.recordAttempt("publish", c.id, c.baseline, 0, 0, false, "failed", err)
+		return err
+	}
+	if m.configPath == "" {
+		err := errors.New("configuration path is empty")
+		m.recordAttempt("publish", c.id, c.baseline, 0, 0, false, "failed", err)
+		return err
+	}
+
+	m.stateMu.Lock()
+	if m.closed {
+		m.stateMu.Unlock()
+		err := errors.New("runtime manager is closed")
+		m.recordAttempt("publish", c.id, c.baseline, 0, 0, false, "failed", err)
+		return err
+	}
+	active := m.active.Load()
+	activeRevision := int64(0)
+	if active != nil {
+		activeRevision = active.revision
+	}
+	if activeRevision != c.baseline {
+		m.stateMu.Unlock()
+		err := fmt.Errorf("%w: candidate baseline %d, current revision %d", ErrBaselineChanged, c.baseline, activeRevision)
+		m.recordAttempt("publish", c.id, c.baseline, activeRevision, 0, false, "conflict", err)
+		return err
+	}
+	m.stateMu.Unlock()
+
+	if err := persistConfig(m.configPath, c.version.config); err != nil {
+		c.markAbandoned()
+		_ = c.closeResources(context.WithoutCancel(ctx))
+		m.forgetCandidate(c)
+		m.recordAttempt("publish", c.id, c.baseline, activeRevision, 0, false, "failed", err)
+		return err
+	}
+
+	m.stateMu.Lock()
+	if m.closed {
+		m.stateMu.Unlock()
+		err := errors.New("runtime manager is closed")
+		c.markAbandoned()
+		_ = c.closeResources(context.WithoutCancel(ctx))
+		m.forgetCandidate(c)
+		m.recordAttempt("publish", c.id, c.baseline, activeRevision, 0, false, "failed", err)
+		return err
+	}
+	current := m.active.Load()
+	currentRevision := int64(0)
+	if current != nil {
+		currentRevision = current.revision
+	}
+	if currentRevision != c.baseline {
+		m.stateMu.Unlock()
+		err := fmt.Errorf("%w: candidate baseline %d, current revision %d", ErrBaselineChanged, c.baseline, currentRevision)
+		m.recordAttempt("publish", c.id, c.baseline, currentRevision, 0, false, "conflict", err)
+		return err
+	}
+	m.revisionSeq++
+	revision := m.revisionSeq
+	c.version.revision = revision
+	m.active.Store(c.version)
+	if current != nil {
+		m.retireVersion(current)
+	}
+	m.appendHistory(ReleaseInfo{
+		Revision:    revision,
+		Config:      cloneConfig(c.version.config),
+		PublishedAt: time.Now().UTC(),
+		Source:      "publish",
+	})
+	c.mu.Lock()
+	c.state = candidatePublished
+	c.mu.Unlock()
+	delete(m.candidates, c.id)
+	m.stateMu.Unlock()
+
+	m.recordAttempt("publish", c.id, c.baseline, activeRevision, revision, true, "switched", nil)
+	return nil
+}
+
+// Abandon releases every resource owned by the candidate. The active version is
+// never touched. Abandon is idempotent and works after a failed Publish.
+func (c *Candidate) Abandon(ctx context.Context) error {
+	c.mu.Lock()
+	if c.state != candidatePrepared {
+		state := c.state
+		c.mu.Unlock()
+		if state == candidateAbandoned {
+			return nil
+		}
+		return fmt.Errorf("%w: %s", ErrCandidateClosed, state)
+	}
+	c.state = candidateAbandoned
+	c.mu.Unlock()
+
+	err := c.closeResources(ctx)
+	m := c.manager
+	m.forgetCandidate(c)
+	m.recordAttempt("abandon", c.id, c.baseline, 0, 0, false, "abandoned", err)
+	return err
+}
+
+func (c *Candidate) closeResources(ctx context.Context) error {
+	c.mu.Lock()
+	version := c.version
+	c.mu.Unlock()
+	return closeResources(ctx, version)
+}
+
+func (c *Candidate) markAbandoned() {
+	c.mu.Lock()
+	c.state = candidateAbandoned
+	c.mu.Unlock()
+}
+
+// CandidateInfo describes a prepared but not yet published candidate.
+type CandidateInfo struct {
+	ID        string
+	Baseline  int64
+	Config    Config
+	CreatedAt time.Time
+}
+
+// ReleaseInfo describes one revision that actually became active.
+type ReleaseInfo struct {
+	Revision    int64
+	Config      Config
+	PublishedAt time.Time
+	Source      string
+}
+
+// AttemptRecord is an audit entry for one real switch or one attempt that did
+// not take effect (validation/preparation failure, baseline conflict,
+// persistence failure, explicit abandon).
+type AttemptRecord struct {
+	Time         time.Time
+	Kind         string
+	CandidateID  string
+	Baseline     int64
+	FromRevision int64
+	ToRevision   int64
+	Switched     bool
+	Result       string
+	Err          string
 }
 
 type Manager struct {
@@ -80,13 +295,18 @@ type Manager struct {
 	modules    map[string]Module
 	order      []string
 
-	stateMu   sync.RWMutex
-	switchMu  sync.Mutex
-	active    atomic.Pointer[version]
-	retired   []*retiredVersion
-	closed    bool
-	closeOnce sync.Once
-	closeDone chan struct{}
+	stateMu      sync.RWMutex
+	switchMu     sync.Mutex
+	active       atomic.Pointer[version]
+	retired      []*retiredVersion
+	candidates   map[string]*Candidate
+	revisionSeq  int64
+	history      []ReleaseInfo
+	attempts     []AttemptRecord
+	candidateSeq int64
+	closed       bool
+	closeOnce    sync.Once
+	closeDone    chan struct{}
 }
 
 type retiredVersion struct {
@@ -99,6 +319,7 @@ func NewManager(configPath string, modules ...Module) (*Manager, error) {
 		configPath: configPath,
 		modules:    make(map[string]Module, len(modules)),
 		closeDone:  make(chan struct{}),
+		candidates: make(map[string]*Candidate),
 	}
 	for _, module := range modules {
 		name := module.Name()
@@ -127,77 +348,273 @@ func Open(ctx context.Context, configPath string, modules ...Module) (*Manager, 
 		return nil, err
 	}
 	if cfg != nil {
-		candidate, err := m.prepareCandidate(ctx, cfg)
+		v, err := m.prepareResources(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}
-		m.active.Store(candidate.version)
+		m.stateMu.Lock()
+		m.revisionSeq = 1
+		v.revision = 1
+		m.active.Store(v)
+		m.appendHistory(ReleaseInfo{
+			Revision:    1,
+			Config:      cloneConfig(v.config),
+			PublishedAt: time.Now().UTC(),
+			Source:      "recover",
+		})
+		m.stateMu.Unlock()
 	}
 	return m, nil
 }
 
 func (m *Manager) Start(ctx context.Context, cfg Config) error {
-	return m.publish(ctx, cfg, true)
+	base := m.currentRevision()
+	if base != 0 {
+		return errors.New("runtime already started")
+	}
+	candidate, err := m.Prepare(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if err := candidate.Publish(ctx); err != nil {
+		_ = candidate.Abandon(context.WithoutCancel(ctx))
+		if errors.Is(err, ErrBaselineChanged) {
+			return errors.New("runtime already started")
+		}
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) Reload(ctx context.Context, cfg Config) error {
-	return m.publish(ctx, cfg, false)
+	base := m.currentRevision()
+	if base == 0 {
+		return errors.New("runtime is not started")
+	}
+	candidate, err := m.Prepare(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	if err := candidate.Publish(ctx); err != nil {
+		_ = candidate.Abandon(context.WithoutCancel(ctx))
+		return err
+	}
+	return nil
 }
 
-func (m *Manager) publish(ctx context.Context, cfg Config, requireInactive bool) error {
+// Prepare validates and prepares a new candidate without publishing it. The
+// candidate is pinned to the revision currently active; resources created by a
+// failed preparation attempt are released before the error is returned.
+func (m *Manager) Prepare(ctx context.Context, cfg Config) (*Candidate, error) {
 	m.switchMu.Lock()
 	defer m.switchMu.Unlock()
 
 	if ctx.Err() != nil {
-		return ctx.Err()
+		m.recordAttempt("prepare", "", m.currentRevision(), 0, 0, false, "failed", ctx.Err())
+		return nil, ctx.Err()
 	}
 	if m.configPath == "" {
-		return errors.New("configuration path is empty")
+		err := errors.New("configuration path is empty")
+		m.recordAttempt("prepare", "", 0, 0, 0, false, "failed", err)
+		return nil, err
 	}
-	if err := m.checkPublishable(requireInactive); err != nil {
-		return err
+	m.stateMu.RLock()
+	closed := m.closed
+	m.stateMu.RUnlock()
+	if closed {
+		err := errors.New("runtime manager is closed")
+		m.recordAttempt("prepare", "", m.currentRevision(), 0, 0, false, "failed", err)
+		return nil, err
 	}
 
-	candidate, err := m.prepareCandidate(ctx, cfg)
+	baseline := m.currentRevision()
+	version, err := m.prepareResources(ctx, cfg)
 	if err != nil {
+		m.recordAttempt("prepare", "", baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	candidate := &Candidate{
+		manager:  m,
+		baseline: baseline,
+		version:  version,
+		created:  time.Now().UTC(),
+		state:    candidatePrepared,
+	}
+	m.stateMu.Lock()
+	m.candidateSeq++
+	candidate.id = fmt.Sprintf("candidate-%d", m.candidateSeq)
+	if m.closed {
+		m.stateMu.Unlock()
+		abandonErr := closeResources(context.WithoutCancel(ctx), version)
+		err := errors.Join(errors.New("runtime manager is closed"), abandonErr)
+		m.recordAttempt("prepare", candidate.id, baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	m.candidates[candidate.id] = candidate
+	m.stateMu.Unlock()
+	m.recordAttempt("prepare", candidate.id, baseline, 0, 0, false, "prepared", nil)
+	return candidate, nil
+}
+
+// Rollback prepares and publishes the configuration of a past revision, pinned
+// to the currently active revision. It performs a real switch and therefore
+// consumes a new revision number; the old revision stays in history.
+func (m *Manager) Rollback(ctx context.Context, revision int64) error {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+
+	info, ok := m.releaseInfo(revision)
+	if !ok {
+		err := fmt.Errorf("%w: %d", ErrRevisionMissing, revision)
+		m.recordAttempt("rollback", "", m.currentRevision(), 0, 0, false, "failed", err)
 		return err
 	}
-
-	m.stateMu.Lock()
-	previous := m.active.Load()
-	if m.closed || (requireInactive && previous != nil) {
-		m.stateMu.Unlock()
-		abandonErr := candidate.abandon(context.WithoutCancel(ctx))
-		if m.closed {
-			return errors.Join(errors.New("runtime manager is closed"), abandonErr)
-		}
-		return errors.Join(errors.New("runtime already started"), abandonErr)
+	if m.closed {
+		err := errors.New("runtime manager is closed")
+		m.recordAttempt("rollback", "", m.currentRevision(), 0, 0, false, "failed", err)
+		return err
 	}
-	m.stateMu.Unlock()
-
-	if err := persistConfig(m.configPath, candidate.version.config); err != nil {
-		return errors.Join(err, candidate.abandon(context.WithoutCancel(ctx)))
+	baseline := m.currentRevision()
+	if baseline == 0 {
+		err := errors.New("runtime is not started")
+		m.recordAttempt("rollback", "", 0, 0, 0, false, "failed", err)
+		return err
 	}
-
+	version, err := m.prepareResources(ctx, info.Config)
+	if err != nil {
+		m.recordAttempt("rollback", "", baseline, 0, 0, false, "failed", err)
+		return err
+	}
+	if err := persistConfig(m.configPath, version.config); err != nil {
+		_ = closeResources(context.WithoutCancel(ctx), version)
+		m.recordAttempt("rollback", "", baseline, 0, 0, false, "failed", err)
+		return err
+	}
 	m.stateMu.Lock()
 	if m.closed {
 		m.stateMu.Unlock()
-		return errors.Join(errors.New("runtime manager is closed"), candidate.rollback(context.WithoutCancel(ctx), previous))
+		_ = closeResources(context.WithoutCancel(ctx), version)
+		err := errors.New("runtime manager is closed")
+		m.recordAttempt("rollback", "", baseline, 0, 0, false, "failed", err)
+		return err
 	}
-	if previous != m.active.Load() {
+	current := m.active.Load()
+	if current == nil || current.revision != baseline {
 		m.stateMu.Unlock()
-		rollbackErr := candidate.rollback(context.WithoutCancel(ctx), previous)
-		if requireInactive && previous == nil {
-			return errors.Join(errors.New("runtime already started"), rollbackErr)
-		}
-		return errors.Join(errors.New("runtime state changed during publish"), rollbackErr)
+		_ = closeResources(context.WithoutCancel(ctx), version)
+		err := ErrBaselineChanged
+		m.recordAttempt("rollback", "", baseline, m.currentRevision(), 0, false, "conflict", err)
+		return err
 	}
-	m.active.Store(candidate.version)
-	if previous != nil {
-		m.retireVersion(previous)
-	}
+	m.revisionSeq++
+	newRevision := m.revisionSeq
+	version.revision = newRevision
+	m.active.Store(version)
+	m.retireVersion(current)
+	m.appendHistory(ReleaseInfo{
+		Revision:    newRevision,
+		Config:      cloneConfig(version.config),
+		PublishedAt: time.Now().UTC(),
+		Source:      fmt.Sprintf("rollback:r%d", revision),
+	})
 	m.stateMu.Unlock()
+	m.recordAttempt("rollback", "", baseline, baseline, newRevision, true, "switched", nil)
 	return nil
+}
+
+// Candidates returns all prepared candidates that are still open.
+func (m *Manager) Candidates() []CandidateInfo {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	infos := make([]CandidateInfo, 0, len(m.candidates))
+	for _, candidate := range m.candidates {
+		infos = append(infos, CandidateInfo{
+			ID:        candidate.id,
+			Baseline:  candidate.baseline,
+			Config:    candidate.Config(),
+			CreatedAt: candidate.created,
+		})
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].ID < infos[j].ID })
+	return infos
+}
+
+// History returns every revision that actually became active, oldest first.
+func (m *Manager) History() []ReleaseInfo {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	history := make([]ReleaseInfo, len(m.history))
+	for i, info := range m.history {
+		history[i] = ReleaseInfo{
+			Revision:    info.Revision,
+			Config:      cloneConfig(info.Config),
+			PublishedAt: info.PublishedAt,
+			Source:      info.Source,
+		}
+	}
+	return history
+}
+
+// Attempts returns the audit trail of real switches and attempts that did not
+// take effect, oldest first.
+func (m *Manager) Attempts() []AttemptRecord {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return append([]AttemptRecord(nil), m.attempts...)
+}
+
+func (m *Manager) currentRevision() int64 {
+	v := m.active.Load()
+	if v == nil {
+		return 0
+	}
+	return v.revision
+}
+
+func (m *Manager) forgetCandidate(candidate *Candidate) {
+	m.stateMu.Lock()
+	delete(m.candidates, candidate.id)
+	m.stateMu.Unlock()
+}
+
+func (m *Manager) releaseInfo(revision int64) (ReleaseInfo, bool) {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	for _, info := range m.history {
+		if info.Revision == revision {
+			return ReleaseInfo{
+				Revision:    info.Revision,
+				Config:      cloneConfig(info.Config),
+				PublishedAt: info.PublishedAt,
+				Source:      info.Source,
+			}, true
+		}
+	}
+	return ReleaseInfo{}, false
+}
+
+// appendHistory must be called with stateMu held.
+func (m *Manager) appendHistory(info ReleaseInfo) {
+	m.history = append(m.history, info)
+}
+
+func (m *Manager) recordAttempt(kind, candidateID string, baseline, fromRevision, toRevision int64, switched bool, result string, err error) {
+	record := AttemptRecord{
+		Time:         time.Now().UTC(),
+		Kind:         kind,
+		CandidateID:  candidateID,
+		Baseline:     baseline,
+		FromRevision: fromRevision,
+		ToRevision:   toRevision,
+		Switched:     switched,
+		Result:       result,
+	}
+	if err != nil {
+		record.Err = err.Error()
+	}
+	m.stateMu.Lock()
+	m.attempts = append(m.attempts, record)
+	m.stateMu.Unlock()
 }
 
 func (m *Manager) Lease() (*Lease, error) {
@@ -239,8 +656,23 @@ func (m *Manager) Close(ctx context.Context) error {
 	active := m.active.Swap(nil)
 	retired := append([]*retiredVersion(nil), m.retired...)
 	m.retired = nil
+	candidates := make([]*Candidate, 0, len(m.candidates))
+	for _, candidate := range m.candidates {
+		candidates = append(candidates, candidate)
+	}
+	m.candidates = make(map[string]*Candidate)
 	m.stateMu.Unlock()
 
+	for _, candidate := range candidates {
+		candidate.mu.Lock()
+		if candidate.state == candidatePrepared {
+			candidate.state = candidateAbandoned
+			candidate.mu.Unlock()
+			_ = closeResources(ctx, candidate.version)
+		} else {
+			candidate.mu.Unlock()
+		}
+	}
 	if active != nil {
 		active.leases.Wait()
 	}
@@ -308,63 +740,41 @@ func (m *Manager) startupOrder() ([]string, error) {
 	return ordered, nil
 }
 
-func (m *Manager) checkPublishable(requireInactive bool) error {
-	m.stateMu.RLock()
-	defer m.stateMu.RUnlock()
-	if m.closed {
-		return errors.New("runtime manager is closed")
-	}
-	if requireInactive && m.active.Load() != nil {
-		return errors.New("runtime already started")
-	}
-	return nil
-}
-
-func (m *Manager) prepareCandidate(ctx context.Context, cfg Config) (*configCandidate, error) {
+func (m *Manager) prepareResources(ctx context.Context, cfg Config) (*version, error) {
 	order, err := m.startupOrder()
 	if err != nil {
 		return nil, err
 	}
-	candidate := &configCandidate{version: &version{
+	v := &version{
 		config:    cloneConfig(cfg),
 		resources: make(map[string]Resource, len(order)),
 		order:     order,
-	}}
+	}
+	cleanup := func(cause error) (*version, error) {
+		return nil, errors.Join(cause, closeResources(context.WithoutCancel(ctx), v))
+	}
 	for _, name := range order {
 		if err := ctx.Err(); err != nil {
-			return nil, errors.Join(err, candidate.abandon(context.WithoutCancel(ctx)))
+			return cleanup(err)
 		}
 		if err := m.modules[name].Validate(ctx, ModuleConfig{Name: name, Raw: cfg[name]}); err != nil {
-			return nil, errors.Join(fmt.Errorf("validate module %q: %w", name, err), candidate.abandon(context.WithoutCancel(ctx)))
+			return cleanup(fmt.Errorf("validate module %q: %w", name, err))
 		}
 	}
 	for _, name := range order {
 		if err := ctx.Err(); err != nil {
-			return nil, errors.Join(err, candidate.abandon(context.WithoutCancel(ctx)))
+			return cleanup(err)
 		}
 		resource, err := m.modules[name].Prepare(ctx, ModuleConfig{Name: name, Raw: cfg[name]})
 		if err != nil {
-			return nil, errors.Join(fmt.Errorf("prepare module %q: %w", name, err), candidate.abandon(context.WithoutCancel(ctx)))
+			return cleanup(fmt.Errorf("prepare module %q: %w", name, err))
 		}
 		if resource == nil {
 			resource = noopResource{}
 		}
-		candidate.version.resources[name] = resource
+		v.resources[name] = resource
 	}
-	return candidate, nil
-}
-
-func (c *configCandidate) abandon(ctx context.Context) error {
-	if c == nil || c.abandoned {
-		return nil
-	}
-	c.abandoned = true
-	return closeResources(ctx, c.version)
-}
-
-func (c *configCandidate) rollback(ctx context.Context, previous *version) error {
-	_ = previous
-	return c.abandon(ctx)
+	return v, nil
 }
 
 func (m *Manager) retireVersion(v *version) {

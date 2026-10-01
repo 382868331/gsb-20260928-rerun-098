@@ -19,6 +19,19 @@
 - 成功 `Reload` 后，新版本立即对新租约可见；旧版本资源等待所有在途租约 `Release` 后关闭。
 - 进程重启时调用 `Open`，只会恢复最近一次真正发布成功的配置并重新准备资源。
 
+## 候选生命周期
+
+需要先准备、稍后再决定是否上线时，使用显式候选 API：
+
+1. `candidate, err := manager.Prepare(ctx, cfg)`：校验并准备全部资源，候选固定在当前活动版本（基线 revision）上。**准备成功不代表生效**：活动配置、磁盘文件和新租约都保持旧版本。
+2. `manager.Candidates()` 查询仍开放的候选；`manager.ActiveConfig()` 查询当前配置；`manager.History()` 查询每次实际发布（含配置快照、revision 和来源）。
+3. `candidate.Publish(ctx)` 原子落盘并切换活动版本。只有当候选基线仍是当前 revision 时才允许发布；若基线已被其他发布推进，返回 `ErrBaselineChanged`，必须放弃后针对新基线重新 `Prepare`，旧候选永远不能覆盖新版本。
+4. `candidate.Abandon(ctx)` 按依赖反序释放候选资源并从候选列表移除，当前服务不受影响；重复调用幂等，不会二次关闭资源。
+5. `manager.Rollback(ctx, revision)` 用历史发布中的配置执行一次真实切换，生成新的 revision 并落盘，旧记录仍保留在历史中；不存在的 revision 返回 `ErrRevisionMissing`。
+6. `manager.Attempts()` 返回对照记录：每次实际切换（`Switched=true`）以及未生效的尝试——校验/准备失败、落盘失败、基线冲突、显式放弃——都带时间、类型、基线与错误信息。
+
+准备或发布失败会释放本次候选已创建的资源，原活动版本保持不变；放弃、冲突或管理器关闭都不会在候选列表中残留状态。`Start`/`Reload` 内部等价于“准备 + 发布（+失败自动放弃）”。
+
 ## 使用租约
 
 执行业务操作时通过 `Lease` 固定一个完整配置版本：
