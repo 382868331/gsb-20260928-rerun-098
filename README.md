@@ -32,6 +32,19 @@
 
 准备或发布失败会释放本次候选已创建的资源，原活动版本保持不变；放弃、冲突或管理器关闭都不会在候选列表中残留状态。`Start`/`Reload` 内部等价于“准备 + 发布（+失败自动放弃）”。
 
+## 联合批次
+
+多个关联模块可以组成一个候选批次，只在全部必需模块就绪且兼容条件满足时一次性整体生效：
+
+1. `batch, err := manager.PrepareBatch(ctx, BatchSpec{Modules: []BatchModule{...}, Compatible: fn})`：每个模块用 `BatchModule{Name, Raw, Required}` 声明。批次固定在当前 revision 上，并为其整个生命周期钉住基线中未变更模块的资源，因此确认后的集合永远是一组彼此兼容的配置，不会与其他模块的新版本拼接。
+2. `batch.Modules()` 查看每个模块的准备状态（`ready`/`unchanged`/`failed`/`skipped`）、占用的资源和失败原因；`batch.Ready()` 只有在所有必需模块就绪且兼容条件成立时才为真。可选模块（`Required: false`）准备失败时降级为 `skipped`，沿用基线资源，不阻塞批次；必需模块失败或兼容条件不满足时批次进入 `failed`/`incompatible` 状态，返回错误并保留可查询记录。
+3. `Compatible func(view map[string]ModuleConfig) error` 针对“新模块配置 + 其余基线配置”的完整视图声明跨模块兼容条件，准备完成后和确认前各检查一次。
+4. `batch.Confirm(ctx)` 原子落盘并整体切换；必需模块未就绪返回 `ErrBatchNotReady`，基线 revision 已被其他发布推进返回 `ErrBaselineChanged`。读者通过租约只能看到旧的完整集合或新的完整集合。
+5. `batch.Abandon(ctx)` 释放本批次新增资源，幂等；仍由旧批次、在途租约或其他候选批次使用的资源不会被关闭。`batch.Resources()` 返回每个资源的处理记录，区分新增（`new`）、旧批次仍占用（`kept`）和清理失败（`cleanup-failed`）；`manager.BatchRecords()` 保留所有批次（含失败、放弃、已确认）的可查询记录。
+6. 两个候选批次可以交错准备；确认前若基线变化，未确认批次只能放弃后按新基线重新准备。`manager.Rollback(ctx, revision)` 同样是一次完整集合的联合切换，生成新 revision，旧资源等待在途租约结束后按依赖反序关闭。
+
+资源按引用计数共享：活动版本、开放候选/批次和在途租约都持有引用，资源在最后一个引用释放时才关闭且只关闭一次。已经开始的读取通过 `Lease`（可用 `lease.Revision()` 查看归属）固定其批次归属，释放任何候选批次都不会破坏尚未结束的读取或其他候选批次的资源。
+
 ## 使用租约
 
 执行业务操作时通过 `Lease` 固定一个完整配置版本：
