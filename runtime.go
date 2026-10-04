@@ -21,6 +21,9 @@ var (
 	ErrBaselineChanged = errors.New("candidate baseline is no longer active")
 	ErrCandidateClosed = errors.New("candidate is no longer open")
 	ErrRevisionMissing = errors.New("revision is not part of the release history")
+	ErrBatchNotReady   = errors.New("batch required modules are not all prepared")
+	ErrBatchNotFound   = errors.New("batch is not open")
+	ErrIncompatible    = errors.New("batch modules are incompatible")
 )
 
 type ModuleConfig struct {
@@ -53,6 +56,24 @@ type Lease struct {
 	release func()
 }
 
+// Revision reports the release revision this lease is pinned to. It never
+// changes for the lifetime of the lease, even after later publishes.
+func (l *Lease) Revision() int64 {
+	if l == nil || l.version == nil {
+		return 0
+	}
+	return l.version.revision
+}
+
+// BatchID reports the joint batch the pinned release originated from. It is
+// empty for the initial start, plain reloads and rollbacks.
+func (l *Lease) BatchID() string {
+	if l == nil || l.version == nil {
+		return ""
+	}
+	return l.version.batchID
+}
+
 func (l *Lease) Resource(name string) Resource {
 	if l == nil || l.version == nil {
 		return nil
@@ -76,10 +97,50 @@ func (l *Lease) Release() {
 
 type version struct {
 	revision  int64
+	batchID   string
 	config    Config
-	resources map[string]Resource
+	handles   map[string]*resourceHandle
 	order     []string
 	leases    sync.WaitGroup
+}
+
+// resourceHandle owns one live Resource and tracks how many live versions and
+// open candidates still reference it. The underlying resource is closed once,
+// when the last reference disappears, so a module whose configuration did not
+// change keeps being served by the very same resource across releases and is
+// never closed while an in-flight lease (of any compatible version) uses it.
+type resourceHandle struct {
+	manager  *Manager
+	resource Resource
+	id       string
+	module   string
+	new      bool
+	refs     int64
+	closed   bool
+	mu       sync.Mutex
+}
+
+// ResourceID identifies a concrete live resource. Modules may implement it to
+// return a stable identifier; otherwise the module name is used.
+type Resource interface {
+	Close(ctx context.Context) error
+}
+
+type resourceNamer interface {
+	ResourceID() string
+}
+
+func (h *resourceHandle) release(ctx context.Context) error {
+	h.mu.Lock()
+	h.refs--
+	if h.refs > 0 || h.closed {
+		h.mu.Unlock()
+		return nil
+	}
+	h.closed = true
+	res := h.resource
+	h.mu.Unlock()
+	return res.Close(ctx)
 }
 
 const (
