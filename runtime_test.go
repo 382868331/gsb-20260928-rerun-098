@@ -13,26 +13,33 @@ import (
 )
 
 type testConfig struct {
-	Generation   int  `json:"generation"`
-	FailValidate bool `json:"failValidate"`
-	FailPrepare  bool `json:"failPrepare"`
+	Generation       int            `json:"generation"`
+	FailValidate     bool           `json:"failValidate"`
+	FailPrepare      bool           `json:"failPrepare"`
+	RejectDependency string         `json:"rejectDependency"`
+	DependencyGen    map[string]int `json:"dependencyGen"`
 }
 
 type testResource struct {
 	module     string
 	generation int
 	closes     *closeLog
+	failClose  bool
 }
 
 func (r *testResource) Close(context.Context) error {
 	r.closes.record(r.module, r.generation)
+	if r.failClose {
+		return errors.New("forced close failure")
+	}
 	return nil
 }
 
 type testModule struct {
-	name   string
-	deps   []string
-	closes *closeLog
+	name       string
+	deps       []string
+	closes     *closeLog
+	failCloses map[int]bool
 }
 
 func (m *testModule) Name() string { return m.name }
@@ -58,7 +65,25 @@ func (m *testModule) Prepare(_ context.Context, config ModuleConfig) (Resource, 
 	if cfg.FailPrepare {
 		return nil, errors.New("forced preparation failure")
 	}
-	return &testResource{module: m.name, generation: cfg.Generation, closes: m.closes}, nil
+	return &testResource{module: m.name, generation: cfg.Generation, closes: m.closes, failClose: m.failCloses[cfg.Generation]}, nil
+}
+
+func (m *testModule) CheckCompatibility(_ context.Context, config ModuleConfig, dependencies map[string]ModuleConfig) error {
+	var cfg testConfig
+	if err := config.Decode(&cfg); err != nil {
+		return err
+	}
+	if cfg.RejectDependency != "" {
+		dep := dependencies[cfg.RejectDependency]
+		var depCfg testConfig
+		if err := dep.Decode(&depCfg); err != nil {
+			return err
+		}
+		if depCfg.Generation != cfg.DependencyGen[cfg.RejectDependency] {
+			return errors.New("dependency generation is incompatible")
+		}
+	}
+	return nil
 }
 
 type closeLog struct {
@@ -424,6 +449,24 @@ func configFor(generation int, failures map[string]bool) Config {
 	}
 }
 
+func rawModuleConfig(t *testing.T, cfg testConfig) json.RawMessage {
+	t.Helper()
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func partialConfig(generation int, modules ...string) Config {
+	cfg := Config{}
+	for _, module := range modules {
+		data, _ := json.Marshal(testConfig{Generation: generation})
+		cfg[module] = data
+	}
+	return cfg
+}
+
 func leaseGeneration(t *testing.T, lease *Lease) int {
 	t.Helper()
 	db := lease.Resource("db").(*testResource)
@@ -760,4 +803,227 @@ func TestAttemptTrailRecordsSwitchesAndIneffectiveAttempts(t *testing.T) {
 	if err := manager.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestJointBatchPublishesTwoRelatedModulesAndKeepsReaderConsistency(t *testing.T) {
+	ctx := context.Background()
+	manager, closes, _, _, _ := newTestManager(t)
+	if err := manager.Start(ctx, configFor(1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	old := mustLease(t, manager)
+	oldDB := old.Resource("db")
+
+	batch, err := manager.PrepareBatch(ctx, "joint", []string{"service", "api"}, partialConfig(2, "service", "api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := batch.Modules(); len(got) != 2 || got[0] != "api" || got[1] != "service" {
+		t.Fatalf("batch modules = %v", got)
+	}
+	if batch.Config()["db"] == nil || batch.Config()["api"] == nil {
+		t.Fatal("batch config is not one complete compatible configuration")
+	}
+	if err := batch.Confirm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	lease := mustLease(t, manager)
+	if lease.BatchID() != "joint" || lease.Revision() != 2 {
+		t.Fatalf("joint lease revision=%d batch=%q", lease.Revision(), lease.BatchID())
+	}
+	if lease.Resource("db") != oldDB {
+		t.Fatal("unchanged db resource was recreated")
+	}
+	if gen := resourceGeneration(lease.Resource("service")); gen != 2 || resourceGeneration(lease.Resource("api")) != 2 {
+		t.Fatal("joint modules did not publish as one version")
+	}
+	lease.Release()
+	currentLease := mustLease(t, manager)
+	currentDB := currentLease.Resource("db")
+	if currentDB != oldDB {
+		t.Fatal("unchanged db resource was recreated")
+	}
+	currentLease.Release()
+	for _, event := range closes.snapshot() {
+		if event.generation == 1 && event.module == "db" {
+			t.Fatal("old db closed while an old lease still held it")
+		}
+	}
+	old.Release()
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJointBatchPreparationFailureCompatibilityAndStaleConfirmationAreIsolated(t *testing.T) {
+	ctx := context.Background()
+	manager, closes, _, _, _ := newTestManager(t)
+	if err := manager.Start(ctx, configFor(1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	hold := mustLease(t, manager)
+	before := len(closes.snapshot())
+
+	batch, err := manager.PrepareBatch(ctx, "bad", []string{"db", "service"}, Config{
+		"db":      rawModuleConfig(t, testConfig{Generation: 2, FailPrepare: true}),
+		"service": rawModuleConfig(t, testConfig{Generation: 2}),
+	})
+	if err == nil {
+		t.Fatal("required module preparation failure unexpectedly succeeded")
+	}
+	if batch != nil {
+		t.Fatal("failed batch returned a handle")
+	}
+	for _, event := range closes.snapshot()[before:] {
+		if event.generation != 2 || event.module != "db" {
+			t.Fatalf("failed batch closed wrong resource: %+v", event)
+		}
+	}
+
+	other, err := manager.PrepareBatch(ctx, "other", []string{"service", "api"}, partialConfig(2, "service", "api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compatible, err := manager.PrepareBatch(ctx, "compatible", []string{"service", "api"}, Config{
+		"service": rawModuleConfig(t, testConfig{Generation: 3}),
+		"api": rawModuleConfig(t, testConfig{
+			Generation: 4, RejectDependency: "service", DependencyGen: map[string]int{"service": 99},
+		}),
+	})
+	if compatible != nil {
+		t.Fatal("incompatible candidate returned")
+	}
+	if !errors.Is(err, ErrIncompatible) {
+		t.Fatalf("compatibility err = %v, want ErrIncompatible", err)
+	}
+	if infos := manager.Batches(); len(infos) != 1 || infos[0].ID != "other" {
+		t.Fatalf("open batches = %+v", infos)
+	}
+	if err := manager.Reload(ctx, configFor(3, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Confirm(ctx); !errors.Is(err, ErrBaselineChanged) {
+		t.Fatalf("stale confirm err = %v, want ErrBaselineChanged", err)
+	}
+	if err := other.Abandon(ctx); err != nil {
+		t.Fatal(err)
+	}
+	active := mustLease(t, manager)
+	if gen := leaseGeneration(t, active); gen != 3 {
+		t.Fatalf("active generation = %d, want 3", gen)
+	}
+	active.Release()
+	hold.Release()
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInterleavedBatchesAndJointRollbackPreserveUnchangedAndAuditCleanup(t *testing.T) {
+	ctx := context.Background()
+	manager, closes, _, _, _ := newTestManager(t)
+	if err := manager.Start(ctx, configFor(1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	a, err := manager.PrepareBatch(ctx, "a", []string{"db"}, partialConfig(2, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := manager.PrepareBatch(ctx, "b", []string{"service", "api"}, partialConfig(3, "service", "api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Confirm(ctx); err != nil {
+		t.Fatal(err)
+	}
+	auditBeforeStale := len(manager.CleanupRecords())
+	if err := a.Confirm(ctx); !errors.Is(err, ErrBaselineChanged) {
+		t.Fatalf("interleaved stale batch err = %v", err)
+	}
+	if err := a.Abandon(ctx); err != nil {
+		t.Fatal(err)
+	}
+	results := cleanupCounts(manager.CleanupRecords()[auditBeforeStale:])
+	if results["added"] != 1 || results["retained"]+results["released"] < 2 {
+		t.Fatalf("cleanup after abandon = %+v", results)
+	}
+	history := manager.History()
+	if err := manager.Rollback(ctx, history[0].Revision); err != nil {
+		t.Fatal(err)
+	}
+	lease := mustLease(t, manager)
+	if lease.BatchID() != "" || leaseGeneration(t, lease) != 1 {
+		t.Fatal("rollback did not restore complete original configuration")
+	}
+	lease.Release()
+	if err := manager.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	_ = closes
+}
+
+func TestAbandonFailureIsRecordedWithoutAffectingOtherCandidates(t *testing.T) {
+	ctx := context.Background()
+	closes := &closeLog{}
+	db := &testModule{name: "db", closes: closes, failCloses: map[int]bool{2: true}}
+	service := &testModule{name: "service", deps: []string{"db"}, closes: closes}
+	api := &testModule{name: "api", deps: []string{"service"}, closes: closes}
+	manager, err := NewManager(filepath.Join(t.TempDir(), "config.json"), api, service, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(ctx, configFor(1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	failing, err := manager.PrepareBatch(ctx, "failing", []string{"db"}, partialConfig(2, "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other, err := manager.PrepareBatch(ctx, "other", []string{"api"}, partialConfig(3, "api"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := failing.Abandon(ctx); err == nil {
+		t.Fatal("release failure unexpectedly succeeded")
+	}
+	if infos := manager.Batches(); len(infos) != 1 || infos[0].ID != "other" {
+		t.Fatalf("other batches after failed abandon = %+v", infos)
+	}
+	failed := manager.CleanupRecords()
+	var sawFailure bool
+	for _, record := range failed {
+		if record.Result == "release-failed" && record.Module == "db" && record.Err != "" {
+			sawFailure = true
+		}
+	}
+	if !sawFailure {
+		t.Fatalf("release failure not recorded: %+v", failed)
+	}
+	if err := other.Abandon(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Close(ctx); err != nil {
+		t.Fatalf("failed candidate cleanup affected manager close: %v", err)
+	}
+}
+
+func mustLease(t *testing.T, manager *Manager) *Lease {
+	t.Helper()
+	lease, err := manager.Lease()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return lease
+}
+
+func resourceGeneration(resource Resource) int {
+	return resource.(*testResource).generation
+}
+
+func cleanupCounts(records []CleanupRecord) map[string]int {
+	counts := map[string]int{}
+	for _, record := range records {
+		counts[record.Result]++
+	}
+	return counts
 }

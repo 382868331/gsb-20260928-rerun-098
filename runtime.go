@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -44,6 +45,14 @@ type Resource interface {
 	Close(ctx context.Context) error
 }
 
+// CompatibilityChecker optionally validates one module against the dependency
+// configurations in the same joint release. Dependencies contains only the
+// modules named by Dependencies. Returning an error rejects the whole batch
+// before any changed resource is published.
+type CompatibilityChecker interface {
+	CheckCompatibility(ctx context.Context, config ModuleConfig, dependencies map[string]ModuleConfig) error
+}
+
 type Module interface {
 	Name() string
 	Dependencies() []string
@@ -78,7 +87,11 @@ func (l *Lease) Resource(name string) Resource {
 	if l == nil || l.version == nil {
 		return nil
 	}
-	return l.version.resources[name]
+	handle := l.version.handles[name]
+	if handle == nil {
+		return nil
+	}
+	return handle.resource
 }
 
 func (l *Lease) Config(name string) ModuleConfig {
@@ -96,12 +109,13 @@ func (l *Lease) Release() {
 }
 
 type version struct {
-	revision  int64
-	batchID   string
-	config    Config
-	handles   map[string]*resourceHandle
-	order     []string
-	leases    sync.WaitGroup
+	revision int64
+	batchID  string
+	config   Config
+	handles  map[string]*resourceHandle
+	order    []string
+	created  map[string]bool
+	leases   sync.WaitGroup
 }
 
 // resourceHandle owns one live Resource and tracks how many live versions and
@@ -120,27 +134,51 @@ type resourceHandle struct {
 	mu       sync.Mutex
 }
 
-// ResourceID identifies a concrete live resource. Modules may implement it to
-// return a stable identifier; otherwise the module name is used.
-type Resource interface {
-	Close(ctx context.Context) error
-}
-
 type resourceNamer interface {
 	ResourceID() string
 }
 
-func (h *resourceHandle) release(ctx context.Context) error {
-	h.mu.Lock()
-	h.refs--
-	if h.refs > 0 || h.closed {
-		h.mu.Unlock()
-		return nil
+func (v *version) release(ctx context.Context, closedResult string) error {
+	var errs []error
+	for i := len(v.order) - 1; i >= 0; i-- {
+		name := v.order[i]
+		handle := v.handles[name]
+		if handle == nil {
+			continue
+		}
+		handle.mu.Lock()
+		remaining := handle.refs - 1
+		handle.refs = remaining
+		if remaining > 0 || handle.closed {
+			id, module := handle.id, handle.module
+			handle.mu.Unlock()
+			handle.manager.recordCleanup("retained", module, id, "")
+			continue
+		}
+		res := handle.resource
+		id, module := handle.id, handle.module
+		handle.mu.Unlock()
+
+		err := res.Close(ctx)
+		if err != nil {
+			handle.manager.recordCleanup("release-failed", module, id, err.Error())
+			errs = append(errs, fmt.Errorf("close module %q resource %q: %w", module, id, err))
+			continue
+		}
+		handle.mu.Lock()
+		handle.closed = true
+		handle.mu.Unlock()
+		result := closedResult
+		if v.created[name] {
+			result = "added"
+		}
+		handle.manager.recordCleanup(result, module, id, "")
 	}
-	h.closed = true
-	res := h.resource
-	h.mu.Unlock()
-	return res.Close(ctx)
+	return errors.Join(errs...)
+}
+
+func (v *version) createdHandles() map[string]bool {
+	return cloneSet(v.created)
 }
 
 const (
@@ -153,11 +191,15 @@ const (
 // Its resources stay alive until Publish, Abandon or Manager.Close, but a
 // prepared candidate never becomes active on its own.
 type Candidate struct {
-	manager  *Manager
-	id       string
-	baseline int64
-	version  *version
-	created  time.Time
+	manager   *Manager
+	id        string
+	baseline  int64
+	version   *version
+	modules   map[string]bool
+	batchID   string
+	inherited map[string]bool
+	detached  bool
+	created   time.Time
 
 	mu    sync.Mutex
 	state string
@@ -174,6 +216,26 @@ func (c *Candidate) Baseline() int64 {
 
 func (c *Candidate) Config() Config {
 	return cloneConfig(c.version.config)
+}
+
+// Modules reports the modules explicitly included in a joint preparation. It
+// is nil for a candidate prepared from one complete configuration.
+func (c *Candidate) Modules() []string {
+	if c.modules == nil {
+		return nil
+	}
+	modules := make([]string, 0, len(c.modules))
+	for module := range c.modules {
+		modules = append(modules, module)
+	}
+	sort.Strings(modules)
+	return modules
+}
+
+// BatchID reports the joint batch this candidate belongs to. It is empty for
+// ordinary full-configuration candidates and releases.
+func (c *Candidate) BatchID() string {
+	return c.batchID
 }
 
 func (c *Candidate) CreatedAt() time.Time {
@@ -228,6 +290,9 @@ func (c *Candidate) Publish(ctx context.Context) error {
 	if activeRevision != c.baseline {
 		m.stateMu.Unlock()
 		err := fmt.Errorf("%w: candidate baseline %d, current revision %d", ErrBaselineChanged, c.baseline, activeRevision)
+		if detachErr := c.detachInherited(context.WithoutCancel(ctx)); detachErr != nil {
+			m.recordAttempt("cleanup", c.id, c.baseline, activeRevision, 0, false, "failed", detachErr)
+		}
 		m.recordAttempt("publish", c.id, c.baseline, activeRevision, 0, false, "conflict", err)
 		return err
 	}
@@ -259,27 +324,34 @@ func (c *Candidate) Publish(ctx context.Context) error {
 	if currentRevision != c.baseline {
 		m.stateMu.Unlock()
 		err := fmt.Errorf("%w: candidate baseline %d, current revision %d", ErrBaselineChanged, c.baseline, currentRevision)
+		if detachErr := c.detachInherited(context.WithoutCancel(ctx)); detachErr != nil {
+			m.recordAttempt("cleanup", c.id, c.baseline, currentRevision, 0, false, "failed", detachErr)
+		}
 		m.recordAttempt("publish", c.id, c.baseline, currentRevision, 0, false, "conflict", err)
 		return err
 	}
 	m.revisionSeq++
 	revision := m.revisionSeq
 	c.version.revision = revision
+	c.version.batchID = c.batchID
 	m.active.Store(c.version)
-	if current != nil {
-		m.retireVersion(current)
-	}
 	m.appendHistory(ReleaseInfo{
 		Revision:    revision,
+		BatchID:     c.batchID,
 		Config:      cloneConfig(c.version.config),
 		PublishedAt: time.Now().UTC(),
-		Source:      "publish",
+		Source:      publishSource(c.batchID),
 	})
 	c.mu.Lock()
 	c.state = candidatePublished
 	c.mu.Unlock()
 	delete(m.candidates, c.id)
 	m.stateMu.Unlock()
+	if current != nil {
+		if err := m.retireVersion(context.WithoutCancel(ctx), current); err != nil {
+			m.recordAttempt("cleanup", c.id, c.baseline, revision, revision, false, "failed", err)
+		}
+	}
 
 	m.recordAttempt("publish", c.id, c.baseline, activeRevision, revision, true, "switched", nil)
 	return nil
@@ -310,8 +382,92 @@ func (c *Candidate) Abandon(ctx context.Context) error {
 func (c *Candidate) closeResources(ctx context.Context) error {
 	c.mu.Lock()
 	version := c.version
+	detached := c.detached
 	c.mu.Unlock()
-	return closeResources(ctx, version)
+	if detached {
+		return c.releaseAdded(ctx)
+	}
+	return errors.Join(c.detachInherited(ctx), version.release(ctx, "added"))
+}
+
+func (c *Candidate) releaseAdded(ctx context.Context) error {
+	c.mu.Lock()
+	version := c.version
+	c.mu.Unlock()
+	var errs []error
+	for i := len(version.order) - 1; i >= 0; i-- {
+		name := version.order[i]
+		if !version.created[name] {
+			continue
+		}
+		handle := version.handles[name]
+		if handle == nil {
+			continue
+		}
+		handle.mu.Lock()
+		remaining := handle.refs - 1
+		handle.refs = remaining
+		if remaining > 0 || handle.closed {
+			id, module := handle.id, handle.module
+			handle.mu.Unlock()
+			c.manager.recordCleanup("retained", module, id, "")
+			continue
+		}
+		res := handle.resource
+		id, module := handle.id, handle.module
+		handle.mu.Unlock()
+		if err := res.Close(ctx); err != nil {
+			c.manager.recordCleanup("release-failed", module, id, err.Error())
+			errs = append(errs, fmt.Errorf("close module %q resource %q: %w", module, id, err))
+			continue
+		}
+		handle.mu.Lock()
+		handle.closed = true
+		handle.mu.Unlock()
+		c.manager.recordCleanup("added", module, id, "")
+	}
+	return errors.Join(errs...)
+}
+
+func (c *Candidate) detachInherited(ctx context.Context) error {
+	c.mu.Lock()
+	inherited := cloneSet(c.inherited)
+	version := c.version
+	c.inherited = nil
+	c.detached = true
+	c.mu.Unlock()
+	var errs []error
+	for name := range inherited {
+		handle := version.handles[name]
+		if handle == nil {
+			continue
+		}
+		handle.mu.Lock()
+		remaining := handle.refs - 1
+		handle.refs = remaining
+		if remaining > 0 || handle.closed {
+			id, module := handle.id, handle.module
+			handle.mu.Unlock()
+			c.manager.recordCleanup("retained", module, id, "")
+			continue
+		}
+		res := handle.resource
+		id, module := handle.id, handle.module
+		handle.mu.Unlock()
+		if err := res.Close(ctx); err != nil {
+			handle.mu.Lock()
+			handle.refs++
+			handle.mu.Unlock()
+			c.manager.recordCleanup("release-failed", module, id, err.Error())
+			errs = append(errs, fmt.Errorf("close module %q resource %q: %w", module, id, err))
+			continue
+		}
+		handle.mu.Lock()
+		handle.closed = true
+		handle.mu.Unlock()
+		c.manager.recordCleanup("released", module, id, "")
+	}
+	return errors.Join(errs...)
 }
 
 func (c *Candidate) markAbandoned() {
@@ -323,7 +479,9 @@ func (c *Candidate) markAbandoned() {
 // CandidateInfo describes a prepared but not yet published candidate.
 type CandidateInfo struct {
 	ID        string
+	BatchID   string
 	Baseline  int64
+	Modules   []string
 	Config    Config
 	CreatedAt time.Time
 }
@@ -331,6 +489,7 @@ type CandidateInfo struct {
 // ReleaseInfo describes one revision that actually became active.
 type ReleaseInfo struct {
 	Revision    int64
+	BatchID     string
 	Config      Config
 	PublishedAt time.Time
 	Source      string
@@ -351,6 +510,69 @@ type AttemptRecord struct {
 	Err          string
 }
 
+// CleanupRecord explains what happened to one resource reference when a
+// candidate or retired version was released. Added resources were created by
+// the released scope, retained resources remain referenced by another active
+// version/open candidate, and release-failed resources still need attention.
+type CleanupRecord struct {
+	Time       time.Time
+	Result     string
+	Module     string
+	ResourceID string
+	Err        string
+}
+
+// Batch is a jointly prepared update of one or more modules.
+type Batch struct {
+	candidate *Candidate
+}
+
+func (b *Batch) ID() string {
+	return b.candidate.id
+}
+
+func (b *Batch) BatchID() string {
+	return b.candidate.batchID
+}
+
+func (b *Batch) Baseline() int64 {
+	return b.candidate.baseline
+}
+
+func (b *Batch) Modules() []string {
+	return b.candidate.Modules()
+}
+
+func (b *Batch) Config() Config {
+	return b.candidate.Config()
+}
+
+func (b *Batch) Status() string {
+	return b.candidate.Status()
+}
+
+// Confirm atomically publishes every module in the batch. It returns
+// ErrBaselineChanged without changing either the active release or this batch
+// when the confirmation basis has moved.
+func (b *Batch) Confirm(ctx context.Context) error {
+	return b.candidate.Publish(ctx)
+}
+
+// Abandon releases resources newly prepared by this batch. Handles inherited
+// from the baseline and shared with other candidates stay alive.
+func (b *Batch) Abandon(ctx context.Context) error {
+	return b.candidate.Abandon(ctx)
+}
+
+type BatchInfo struct {
+	ID        string
+	BatchID   string
+	Baseline  int64
+	Modules   []string
+	Config    Config
+	CreatedAt time.Time
+}
+
 type Manager struct {
 	configPath string
 	modules    map[string]Module
@@ -362,8 +584,10 @@ type Manager struct {
 	retired      []*retiredVersion
 	candidates   map[string]*Candidate
 	revisionSeq  int64
+	resourceSeq  int64
 	history      []ReleaseInfo
 	attempts     []AttemptRecord
+	cleanups     []CleanupRecord
 	candidateSeq int64
 	closed       bool
 	closeOnce    sync.Once
@@ -409,7 +633,7 @@ func Open(ctx context.Context, configPath string, modules ...Module) (*Manager, 
 		return nil, err
 	}
 	if cfg != nil {
-		v, err := m.prepareResources(ctx, cfg)
+		v, _, err := m.prepareVersion(ctx, cfg, nil, "")
 		if err != nil {
 			return nil, err
 		}
@@ -489,24 +713,18 @@ func (m *Manager) Prepare(ctx context.Context, cfg Config) (*Candidate, error) {
 	}
 
 	baseline := m.currentRevision()
-	version, err := m.prepareResources(ctx, cfg)
+	version, _, err := m.prepareVersion(ctx, cfg, nil, "")
 	if err != nil {
 		m.recordAttempt("prepare", "", baseline, 0, 0, false, "failed", err)
 		return nil, err
 	}
-	candidate := &Candidate{
-		manager:  m,
-		baseline: baseline,
-		version:  version,
-		created:  time.Now().UTC(),
-		state:    candidatePrepared,
-	}
+	candidate := m.newCandidate("", baseline, version, nil, nil)
 	m.stateMu.Lock()
 	m.candidateSeq++
 	candidate.id = fmt.Sprintf("candidate-%d", m.candidateSeq)
 	if m.closed {
 		m.stateMu.Unlock()
-		abandonErr := closeResources(context.WithoutCancel(ctx), version)
+		abandonErr := version.release(context.WithoutCancel(ctx), "added")
 		err := errors.Join(errors.New("runtime manager is closed"), abandonErr)
 		m.recordAttempt("prepare", candidate.id, baseline, 0, 0, false, "failed", err)
 		return nil, err
@@ -515,6 +733,132 @@ func (m *Manager) Prepare(ctx context.Context, cfg Config) (*Candidate, error) {
 	m.stateMu.Unlock()
 	m.recordAttempt("prepare", candidate.id, baseline, 0, 0, false, "prepared", nil)
 	return candidate, nil
+}
+
+// PrepareBatch validates compatibility and prepares a joint update for the
+// named modules. updates is a partial configuration: omitted modules keep the
+// exact active configuration and continue using their existing resources. An
+// empty batchID is assigned automatically.
+func (m *Manager) PrepareBatch(ctx context.Context, batchID string, modules []string, updates Config) (*Batch, error) {
+	m.switchMu.Lock()
+	defer m.switchMu.Unlock()
+
+	baseline := m.currentRevision()
+	if baseline == 0 {
+		err := errors.New("runtime is not started")
+		m.recordAttempt("prepare-batch", "", 0, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	if m.isClosed() {
+		err := errors.New("runtime manager is closed")
+		m.recordAttempt("prepare-batch", "", baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		m.recordAttempt("prepare-batch", "", baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+
+	selected, err := normalizeModules(m.modules, modules)
+	if err != nil {
+		m.recordAttempt("prepare-batch", "", baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	m.stateMu.Lock()
+	if batchID == "" {
+		m.candidateSeq++
+		batchID = fmt.Sprintf("batch-%d", m.candidateSeq)
+	}
+	if _, exists := m.candidates[batchID]; exists {
+		m.stateMu.Unlock()
+		err := fmt.Errorf("batch %q is already open", batchID)
+		m.recordAttempt("prepare-batch", batchID, baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	m.stateMu.Unlock()
+
+	version, _, err := m.prepareVersion(ctx, updates, selected, batchID)
+	if err != nil {
+		m.recordAttempt("prepare-batch", batchID, baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	candidate := m.newCandidate(batchID, baseline, version, selected, inheritedSet(version, selected))
+	candidate.id = batchID
+	m.stateMu.Lock()
+	if m.closed {
+		m.stateMu.Unlock()
+		abandonErr := version.release(context.WithoutCancel(ctx), "added")
+		err := errors.Join(errors.New("runtime manager is closed"), abandonErr)
+		m.recordAttempt("prepare-batch", batchID, baseline, 0, 0, false, "failed", err)
+		return nil, err
+	}
+	m.candidates[batchID] = candidate
+	m.stateMu.Unlock()
+	m.recordAttempt("prepare-batch", batchID, baseline, 0, 0, false, "prepared", nil)
+	return &Batch{candidate: candidate}, nil
+}
+
+// Batches returns joint candidates that are still open.
+func (m *Manager) Batches() []BatchInfo {
+	infos := make([]BatchInfo, 0)
+	for _, candidate := range m.Candidates() {
+		if candidate.BatchID == "" {
+			continue
+		}
+		infos = append(infos, BatchInfo{
+			ID:        candidate.ID,
+			BatchID:   candidate.BatchID,
+			Baseline:  candidate.Baseline,
+			Modules:   candidate.Modules,
+			Config:    candidate.Config,
+			CreatedAt: candidate.CreatedAt,
+		})
+	}
+	return infos
+}
+
+// Batch returns the open joint batch with the supplied ID.
+func (m *Manager) Batch(id string) (*Batch, error) {
+	m.stateMu.RLock()
+	candidate, ok := m.candidates[id]
+	m.stateMu.RUnlock()
+	if !ok || candidate == nil || candidate.batchID == "" {
+		return nil, fmt.Errorf("%w: %s", ErrBatchNotFound, id)
+	}
+	return &Batch{candidate: candidate}, nil
+}
+
+// ConfirmBatch publishes an open joint batch as one complete release.
+func (m *Manager) ConfirmBatch(ctx context.Context, id string) error {
+	batch, err := m.Batch(id)
+	if err != nil {
+		return err
+	}
+	return batch.Confirm(ctx)
+}
+
+// AbandonBatch discards an open joint batch without affecting the active
+// release, other batches or active leases.
+func (m *Manager) AbandonBatch(ctx context.Context, id string) error {
+	batch, err := m.Batch(id)
+	if err != nil {
+		return err
+	}
+	return batch.Abandon(ctx)
+}
+
+func (m *Manager) newCandidate(batchID string, baseline int64, version *version, modules, inherited map[string]bool) *Candidate {
+	return &Candidate{
+		manager:   m,
+		id:        batchID,
+		batchID:   batchID,
+		baseline:  baseline,
+		version:   version,
+		modules:   modules,
+		inherited: inherited,
+		created:   time.Now().UTC(),
+		state:     candidatePrepared,
+	}
 }
 
 // Rollback prepares and publishes the configuration of a past revision, pinned
@@ -541,20 +885,20 @@ func (m *Manager) Rollback(ctx context.Context, revision int64) error {
 		m.recordAttempt("rollback", "", 0, 0, 0, false, "failed", err)
 		return err
 	}
-	version, err := m.prepareResources(ctx, info.Config)
+	version, _, err := m.prepareVersion(ctx, info.Config, nil, "")
 	if err != nil {
 		m.recordAttempt("rollback", "", baseline, 0, 0, false, "failed", err)
 		return err
 	}
 	if err := persistConfig(m.configPath, version.config); err != nil {
-		_ = closeResources(context.WithoutCancel(ctx), version)
+		_ = version.release(context.WithoutCancel(ctx), "added")
 		m.recordAttempt("rollback", "", baseline, 0, 0, false, "failed", err)
 		return err
 	}
 	m.stateMu.Lock()
 	if m.closed {
 		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), version)
+		_ = version.release(context.WithoutCancel(ctx), "added")
 		err := errors.New("runtime manager is closed")
 		m.recordAttempt("rollback", "", baseline, 0, 0, false, "failed", err)
 		return err
@@ -562,7 +906,7 @@ func (m *Manager) Rollback(ctx context.Context, revision int64) error {
 	current := m.active.Load()
 	if current == nil || current.revision != baseline {
 		m.stateMu.Unlock()
-		_ = closeResources(context.WithoutCancel(ctx), version)
+		_ = version.release(context.WithoutCancel(ctx), "added")
 		err := ErrBaselineChanged
 		m.recordAttempt("rollback", "", baseline, m.currentRevision(), 0, false, "conflict", err)
 		return err
@@ -570,15 +914,19 @@ func (m *Manager) Rollback(ctx context.Context, revision int64) error {
 	m.revisionSeq++
 	newRevision := m.revisionSeq
 	version.revision = newRevision
+	version.batchID = ""
 	m.active.Store(version)
-	m.retireVersion(current)
 	m.appendHistory(ReleaseInfo{
 		Revision:    newRevision,
+		BatchID:     "",
 		Config:      cloneConfig(version.config),
 		PublishedAt: time.Now().UTC(),
 		Source:      fmt.Sprintf("rollback:r%d", revision),
 	})
 	m.stateMu.Unlock()
+	if err := m.retireVersion(context.WithoutCancel(ctx), current); err != nil {
+		m.recordAttempt("cleanup", "", baseline, baseline, newRevision, false, "failed", err)
+	}
 	m.recordAttempt("rollback", "", baseline, baseline, newRevision, true, "switched", nil)
 	return nil
 }
@@ -591,7 +939,9 @@ func (m *Manager) Candidates() []CandidateInfo {
 	for _, candidate := range m.candidates {
 		infos = append(infos, CandidateInfo{
 			ID:        candidate.id,
+			BatchID:   candidate.batchID,
 			Baseline:  candidate.baseline,
+			Modules:   candidate.Modules(),
 			Config:    candidate.Config(),
 			CreatedAt: candidate.created,
 		})
@@ -608,6 +958,7 @@ func (m *Manager) History() []ReleaseInfo {
 	for i, info := range m.history {
 		history[i] = ReleaseInfo{
 			Revision:    info.Revision,
+			BatchID:     info.BatchID,
 			Config:      cloneConfig(info.Config),
 			PublishedAt: info.PublishedAt,
 			Source:      info.Source,
@@ -622,6 +973,84 @@ func (m *Manager) Attempts() []AttemptRecord {
 	m.stateMu.RLock()
 	defer m.stateMu.RUnlock()
 	return append([]AttemptRecord(nil), m.attempts...)
+}
+
+// CleanupRecords returns resource cleanup audit entries. Results are "added"
+// for new resources whose candidate/version failed or was abandoned,
+// "retained" for handles still used elsewhere, "released" for resources that
+// became unused after a successful switch, and "release-failed" for failed
+// Close calls.
+func (m *Manager) CleanupRecords() []CleanupRecord {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return append([]CleanupRecord(nil), m.cleanups...)
+}
+
+func (m *Manager) recordCleanup(result, module, id, errText string) {
+	m.stateMu.Lock()
+	m.cleanups = append(m.cleanups, CleanupRecord{
+		Time:       time.Now().UTC(),
+		Result:     result,
+		Module:     module,
+		ResourceID: id,
+		Err:        errText,
+	})
+	m.stateMu.Unlock()
+}
+
+func (m *Manager) isClosed() bool {
+	m.stateMu.RLock()
+	defer m.stateMu.RUnlock()
+	return m.closed
+}
+
+func normalizeModules(known map[string]Module, modules []string) (map[string]bool, error) {
+	if len(modules) == 0 {
+		return nil, errors.New("joint batch must contain at least one module")
+	}
+	selected := make(map[string]bool, len(modules))
+	for _, module := range modules {
+		if module == "" {
+			return nil, errors.New("joint batch module name must not be empty")
+		}
+		if _, ok := known[module]; !ok {
+			return nil, fmt.Errorf("unknown batch module %q", module)
+		}
+		if selected[module] {
+			return nil, fmt.Errorf("duplicate batch module %q", module)
+		}
+		selected[module] = true
+	}
+	return selected, nil
+}
+
+func cloneSet(set map[string]bool) map[string]bool {
+	clone := make(map[string]bool, len(set))
+	for key, value := range set {
+		clone[key] = value
+	}
+	return clone
+}
+
+func inheritedSet(v *version, selected map[string]bool) map[string]bool {
+	inherited := make(map[string]bool)
+	for _, name := range v.order {
+		if !selected[name] {
+			inherited[name] = true
+		}
+	}
+	return inherited
+}
+
+func publishSource(batchID string) string {
+	if batchID == "" {
+		return "publish"
+	}
+	return "batch:" + batchID
+}
+
+func configEqual(a, b json.RawMessage) bool {
+	return bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b))
 }
 
 func (m *Manager) currentRevision() int64 {
@@ -729,7 +1158,7 @@ func (m *Manager) Close(ctx context.Context) error {
 		if candidate.state == candidatePrepared {
 			candidate.state = candidateAbandoned
 			candidate.mu.Unlock()
-			_ = closeResources(ctx, candidate.version)
+			_ = candidate.version.release(ctx, "added")
 		} else {
 			candidate.mu.Unlock()
 		}
@@ -747,7 +1176,7 @@ func (m *Manager) Close(ctx context.Context) error {
 		}(item)
 	}
 	if active != nil {
-		errCh <- closeResources(ctx, active)
+		errCh <- active.release(ctx, "released")
 	}
 	wg.Wait()
 	close(errCh)
@@ -801,20 +1230,39 @@ func (m *Manager) startupOrder() ([]string, error) {
 	return ordered, nil
 }
 
-func (m *Manager) prepareResources(ctx context.Context, cfg Config) (*version, error) {
+func (m *Manager) prepareVersion(ctx context.Context, updates Config, selected map[string]bool, batchID string) (*version, map[string]bool, error) {
 	order, err := m.startupOrder()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	active := m.active.Load()
+	cfg := Config{}
+	if active != nil {
+		cfg = cloneConfig(active.config)
+	}
+	for name, raw := range updates {
+		if _, known := m.modules[name]; !known {
+			return nil, nil, fmt.Errorf("unknown module %q", name)
+		}
+		if selected != nil && !selected[name] {
+			return nil, nil, fmt.Errorf("%w: update for module %q outside batch", ErrIncompatible, name)
+		}
+		cfg[name] = append(json.RawMessage(nil), raw...)
 	}
 	v := &version{
-		config:    cloneConfig(cfg),
-		resources: make(map[string]Resource, len(order)),
-		order:     order,
+		batchID: batchID,
+		config:  cfg,
+		handles: make(map[string]*resourceHandle, len(order)),
+		order:   order,
+		created: make(map[string]bool, len(order)),
 	}
-	cleanup := func(cause error) (*version, error) {
-		return nil, errors.Join(cause, closeResources(context.WithoutCancel(ctx), v))
+	cleanup := func(cause error) (*version, map[string]bool, error) {
+		return nil, nil, errors.Join(cause, v.release(context.WithoutCancel(ctx), "added"))
 	}
 	for _, name := range order {
+		if _, known := m.modules[name]; !known {
+			return cleanup(fmt.Errorf("missing configuration for module %q", name))
+		}
 		if err := ctx.Err(); err != nil {
 			return cleanup(err)
 		}
@@ -823,6 +1271,14 @@ func (m *Manager) prepareResources(ctx context.Context, cfg Config) (*version, e
 		}
 	}
 	for _, name := range order {
+		if selected != nil && !selected[name] && active != nil && configEqual(active.config[name], cfg[name]) {
+			handle := active.handles[name]
+			handle.mu.Lock()
+			handle.refs++
+			handle.mu.Unlock()
+			v.handles[name] = handle
+			continue
+		}
 		if err := ctx.Err(); err != nil {
 			return cleanup(err)
 		}
@@ -833,18 +1289,44 @@ func (m *Manager) prepareResources(ctx context.Context, cfg Config) (*version, e
 		if resource == nil {
 			resource = noopResource{}
 		}
-		v.resources[name] = resource
+		m.stateMu.Lock()
+		m.resourceSeq++
+		handle := &resourceHandle{manager: m, resource: resource, id: resourceID(name, m.resourceSeq, resource), module: name, refs: 1}
+		m.stateMu.Unlock()
+		v.handles[name] = handle
+		v.created[name] = true
 	}
-	return v, nil
+	for _, name := range order {
+		if selected == nil {
+			continue
+		}
+		if !selected[name] {
+			continue
+		}
+		checker, ok := m.modules[name].(CompatibilityChecker)
+		if !ok {
+			continue
+		}
+		dependencies := make(map[string]ModuleConfig)
+		for _, dependency := range m.modules[name].Dependencies() {
+			dependencies[dependency] = ModuleConfig{Name: dependency, Raw: cfg[dependency]}
+		}
+		if err := checker.CheckCompatibility(ctx, ModuleConfig{Name: name, Raw: cfg[name]}, dependencies); err != nil {
+			return cleanup(fmt.Errorf("%w: compatibility module %q: %w", ErrIncompatible, name, err))
+		}
+	}
+	return v, cloneSet(v.created), nil
 }
 
-func (m *Manager) retireVersion(v *version) {
+func (m *Manager) retireVersion(ctx context.Context, v *version) error {
 	item := &retiredVersion{version: v, done: make(chan error, 1)}
+	m.stateMu.Lock()
 	m.retired = append(m.retired, item)
+	m.stateMu.Unlock()
 	go func() {
 		v.leases.Wait()
+		err := item.version.release(ctx, "released")
 		m.stateMu.Lock()
-		err := closeResources(context.Background(), item.version)
 		remaining := m.retired[:0]
 		for _, retired := range m.retired {
 			if retired != item {
@@ -855,23 +1337,18 @@ func (m *Manager) retireVersion(v *version) {
 		m.stateMu.Unlock()
 		item.done <- err
 	}()
+	return nil
 }
 
 type noopResource struct{}
 
 func (noopResource) Close(context.Context) error { return nil }
 
-func closeResources(ctx context.Context, v *version) error {
-	var errs []error
-	for i := len(v.order) - 1; i >= 0; i-- {
-		name := v.order[i]
-		if resource := v.resources[name]; resource != nil {
-			if err := resource.Close(ctx); err != nil {
-				errs = append(errs, fmt.Errorf("close module %q: %w", name, err))
-			}
-		}
+func resourceID(module string, seq int64, resource Resource) string {
+	if named, ok := resource.(resourceNamer); ok && named.ResourceID() != "" {
+		return named.ResourceID()
 	}
-	return errors.Join(errs...)
+	return fmt.Sprintf("%s-%d", module, seq)
 }
 
 func loadConfig(path string) (Config, error) {

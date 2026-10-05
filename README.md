@@ -19,6 +19,19 @@
 - 成功 `Reload` 后，新版本立即对新租约可见；旧版本资源等待所有在途租约 `Release` 后关闭。
 - 进程重启时调用 `Open`，只会恢复最近一次真正发布成功的配置并重新准备资源。
 
+### 联合发布
+
+多个关联模块可使用 `PrepareBatch(ctx, batchID, modules, updates)` 准备一个联合批次：
+
+1. `updates` 是部分配置，只包含本次显式列出的模块；未列出的模块自动继承当前活动配置。
+2. 批次始终形成一份完整配置：新租约要么拿到旧版本，要么拿到批次版本，不会看到模块交错的中间态。
+3. 模块可实现 `CheckCompatibility(ctx, config, dependencies)`，在资源创建后、整体确认前校验与依赖模块新配置的兼容性；失败会回滚本批次已新增资源。
+4. `Batch.Confirm` 或 `manager.ConfirmBatch` 原子落盘并发布；基线 revision 变化时返回 `ErrBaselineChanged`，旧批次不能覆盖新发布。
+5. `Batch.Abandon` 或 `manager.AbandonBatch` 只释放本批次新增资源，仍被活动版本、其他候选或旧租约引用的资源保留。
+6. 联合发布也进入普通历史；对发布前 revision 执行 `Rollback` 会准备并发布完整旧配置，生成新的 revision。
+
+`CleanupRecords()` 将清理结果区分为 `added`（新增但未发布/已放弃或失败）、`retained`（仍有其他引用）、`released`（最后引用消失并关闭成功）和 `release-failed`（关闭失败，错误随记录返回）。
+
 ## 候选生命周期
 
 需要先准备、稍后再决定是否上线时，使用显式候选 API：
